@@ -1,0 +1,13 @@
+{
+  "name": "race-test",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cross-instance race-condition test for the rate limiter",
+  "type": "module",
+  "scripts": {
+    "test": "node race.mjs"
+  },
+  "dependencies": {
+    "ioredis": "^5.4.1"
+  }
+}
