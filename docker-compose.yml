@@ -1,0 +1,171 @@
+# Global Rate Limiter as a Service — full stack.
+#
+# Single command:  docker compose up --build
+#
+# Topology (see diagram/architecture.png and TRD.md):
+#   nginx (:8080) ──► ratelimiter-1/2/3 ──► redis (hot path, atomic Lua)
+#                                   │
+#                                   └─► redis stream ──► logworker ──► postgres (TimescaleDB)
+#                                                                          │
+#   dashboard-frontend (:3000) ──► dashboard-api (:4000) ─────────────────┘
+#
+# Test profiles (run after the stack is up):
+#   docker compose --profile test run --rm race-test     # race-condition test
+#   docker compose --profile test run --rm k6 run /scripts/load.js
+#   docker compose --profile test run --rm k6 run /scripts/spike.js
+
+services:
+  # ── Hot-path store: source of truth for counters + async log stream ──────
+  # AOF persistence is required so buffered log-stream entries survive a
+  # restart (billing guarantee, TRD §6.2). appendfsync everysec = documented
+  # trade-off: a hard crash can lose at most ~1s of buffered log entries.
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --appendfsync everysec
+    ports:
+      - "6379:6379" # exposed for local test tooling (race test key reset)
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    volumes:
+      - redis-data:/data
+
+  # ── Analytics/billing store ──────────────────────────────────────────────
+  postgres:
+    image: timescale/timescaledb:latest-pg15
+    environment:
+      POSTGRES_USER: ratelimiter
+      POSTGRES_PASSWORD: ratelimiter
+      POSTGRES_DB: ratelimiter
+    ports:
+      - "5432:5432" # exposed for local inspection / chaos-test assertions
+    volumes:
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ratelimiter -d ratelimiter"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  # ── Rate limiter cluster: 3 explicit instances behind nginx ─────────────
+  # Three *named* services (not compose replicas) so the multi-instance
+  # topology is visible and the race test provably crosses instances.
+  ratelimiter-1: &ratelimiter
+    build: ./services/ratelimiter
+    environment: &ratelimiter-env
+      PORT: "3000"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_COMMAND_TIMEOUT_MS: "50" # hot-path budget; breaker opens past this
+      INSTANCE_COUNT: "3"            # seeds the conservative fallback bucket
+      FALLBACK_FRACTION: "0.5"       # fallback gets limit*0.5/instances per window
+      CONFIG_REFRESH_MS: "10000"     # in-memory last-known-good config snapshot
+      BREAKER_FAILURE_THRESHOLD: "3"
+      BREAKER_OPEN_MS: "2000"
+      INSTANCE_ID: rl-1
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # 127.0.0.1, not localhost: busybox wget prefers ::1 but the app
+      # listens on IPv4 0.0.0.0.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  ratelimiter-2:
+    <<: *ratelimiter
+    environment:
+      <<: *ratelimiter-env
+      INSTANCE_ID: rl-2
+
+  ratelimiter-3:
+    <<: *ratelimiter
+    environment:
+      <<: *ratelimiter-env
+      INSTANCE_ID: rl-3
+
+  # ── Load balancer in front of the limiter cluster ────────────────────────
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - ratelimiter-1
+      - ratelimiter-2
+      - ratelimiter-3
+
+  # ── Async log pipeline: stream consumer → Postgres batch writer ─────────
+  logworker:
+    build: ./services/logworker
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      DATABASE_URL: postgres://ratelimiter:ratelimiter@postgres:5432/ratelimiter
+      BATCH_SIZE: "500"
+      BLOCK_MS: "2000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped # chaos test kills it; it must come back and replay
+
+  # ── Read API for the dashboard + config administration ───────────────────
+  dashboard-api:
+    build: ./services/dashboard-api
+    ports:
+      - "4000:4000"
+    environment:
+      PORT: "4000"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      DATABASE_URL: postgres://ratelimiter:ratelimiter@postgres:5432/ratelimiter
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  # ── Dashboard SPA (nginx serves the build, proxies /api → dashboard-api) ─
+  dashboard-frontend:
+    build: ./services/dashboard-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - dashboard-api
+
+  # ── Test profile: race-condition test (runs inside the compose network) ──
+  race-test:
+    profiles: ["test"]
+    build: ./tests/race
+    environment:
+      TARGET_URL: http://nginx
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      CLIENT_ID: test-race-client # seeded with limit=100/60s
+      TOTAL_REQUESTS: "150"
+    depends_on:
+      - nginx
+      - redis
+
+  # ── Test profile: k6 load & spike tests ──────────────────────────────────
+  k6:
+    profiles: ["test"]
+    image: grafana/k6:latest
+    environment:
+      TARGET_URL: http://nginx
+    volumes:
+      - ./tests/k6:/scripts:ro
+    depends_on:
+      - nginx
+
+volumes:
+  redis-data:
+  pg-data:
